@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+# source: https://github.com/BrassTack/pythrun
+
+# This is free and unencumbered software released into the public domain.
+#
+# Anyone is free to copy, modify, publish, use, compile, sell, or
+# distribute this software, either in source code form or as a compiled
+# binary, for any purpose, commercial or non-commercial, and by any
+# means.
+#
+# In jurisdictions that recognize copyright laws, the author or authors
+# of this software dedicate any and all copyright interest in the
+# software to the public domain. We make this dedication for the benefit
+# of the public at large and to the detriment of our heirs and
+# successors. We intend this dedication to be an overt act of
+# relinquishment in perpetuity of all present and future rights to this
+# software under copyright law.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+# For more information, please refer to <http://unlicense.org/>
+
+
+import os
+import sys
+import venv
+import subprocess
+import ast
+import importlib.util
+
+def parse_imports(file_path):
+    with open(file_path, 'r') as file:
+        tree = ast.parse(file.read())
+    
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.add(alias.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imports.add(node.module.split('.')[0])
+    
+    return imports
+
+def create_venv(venv_path):
+    venv.create(venv_path, with_pip=True)
+
+def is_module_available(module_name):
+    return importlib.util.find_spec(module_name) is not None
+
+def install_dependencies(venv_path, dependencies):
+    pip_path = os.path.join(venv_path, 'bin', 'pip')
+    failed_installs = []
+    for dep in dependencies:
+        # Map some common import names to their PyPI package names
+        dep_mapping = {
+            'yaml': 'pyyaml',
+            # Add more mappings as needed
+        }
+        dep = dep_mapping.get(dep, dep)
+        if not is_module_available(dep):
+            try:
+                subprocess.run([pip_path, 'install', dep], check=True, capture_output=True, text=True)
+                print(f"Successfully installed {dep}")
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to install {dep}. Error: {e.stderr.strip()}")
+                failed_installs.append(dep)
+        else:
+            print(f"Module {dep} is already available. Skipping installation.")
+    
+    return failed_installs
+
+# def run_script(venv_path, script_path, args):
+#     python_path = os.path.join(venv_path, 'bin', 'python')
+#     try:
+#         subprocess.run([python_path, script_path] + args, check=True)
+#     except subprocess.CalledProcessError as e:
+#         print(f"Error running the script: {e}")
+#         sys.exit(1)
+
+def run_script(venv_path, script_path, args):
+    python_path = os.path.join(venv_path, 'bin', 'python')
+    full_command = [python_path, script_path] + args
+    print(f"pythrun: Starting execution of {script_path}")
+    print(f"pythrun: Full command: {' '.join(full_command)}")
+    try:
+        print("--- Begin script output ---")
+        result = subprocess.run(full_command, check=False, capture_output=True, text=True)
+        print(result.stdout)
+        if result.stderr:
+            print("Error output:", result.stderr)
+        print("--- End script output ---")
+        print(f"pythrun: Script {script_path} completed. Exit code: {result.returncode}")
+        if result.returncode != 0:
+            print(f"pythrun: Warning: Script exited with non-zero status.")
+        return result.returncode
+    except Exception as e:
+        print(f"pythrun: An unexpected error occurred: {e}")
+        return 1
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: pythrun <script.py> [script arguments...]")
+        sys.exit(1)
+
+    script_path = sys.argv[1]
+    script_args = sys.argv[2:]
+    script_dir = os.path.dirname(os.path.abspath(script_path))
+    venv_path = os.path.join(script_dir, '.venv')
+
+    # Create virtual environment if it doesn't exist
+    if not os.path.exists(venv_path):
+        create_venv(venv_path)
+
+    # Identify dependencies
+    dependencies = set()
+    
+    # Check for requirements.txt
+    requirements_path = os.path.join(script_dir, 'requirements.txt')
+    if os.path.exists(requirements_path):
+        with open(requirements_path, 'r') as req_file:
+            dependencies.update(line.strip() for line in req_file if line.strip())
+
+    # Parse imports from the script
+    dependencies.update(parse_imports(script_path))
+
+    # Remove empty strings
+    dependencies = {dep for dep in dependencies if dep}
+
+    # Install dependencies
+    failed_installs = install_dependencies(venv_path, dependencies)
+    
+    if failed_installs:
+        print(f"Failed to install the following packages: {', '.join(failed_installs)}")
+        print("The script may not run correctly.")
+        user_input = input("Do you want to continue anyway? (y/n): ").lower()
+        if user_input != 'y':
+            print("Aborting script execution.")
+            sys.exit(1)
+
+    print("pythrun: Dependency installation complete. Running the script...")
+    exit_code = run_script(venv_path, script_path, script_args)
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
