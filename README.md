@@ -76,3 +76,10 @@ For more information, please refer to <http://unlicense.org/>
 
 Contributions are welcome! Feel free to submit a pull request or open an issue to discuss potential changes.
 
+## Running the Test Tool
+
+To ensure that the output works properly, you can use the provided test tool. Run the following command:
+
+```bash
+./pythrun pythrun-test.py
+```
