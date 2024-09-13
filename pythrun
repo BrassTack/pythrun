@@ -28,25 +28,60 @@
 
 import os
 import sys
-import pty
 import venv
 import subprocess
 import ast
 import importlib.util
 import json
+import hashlib
+import time
+import argparse
 
 CACHE_FILE_NAME = 'imports_cache.txt'
+METADATA_FILE_NAME = 'metadata.json'
 
-def get_cache_file_path(venv_path):
-    return os.path.join(venv_path, CACHE_FILE_NAME)
+# Log function for general (verbose) output
+def log(message):
+    if not QUIET_MODE:
+        print(message, flush=True)
+
+# Log function for critical output (always shown)
+def log_always(message):
+    print(message, flush=True)
+
+def get_venv_path(script_path):
+    hashed_script_path = hashlib.md5(script_path.encode()).hexdigest()
+    base_venv_dir = os.getenv('PYTHRUN_VENVS_DIR', os.path.expanduser('~/.pythrun_venvs'))
+    return os.path.join(base_venv_dir, hashed_script_path)
+
+def create_metadata_file(venv_path, script_path):
+    metadata = {
+        'script_path': script_path,
+        'created_at': time.strftime('%Y-%m-%d %H:%M:%S')
+    }
+    metadata_file = os.path.join(venv_path, METADATA_FILE_NAME)
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f)
+
+def load_cached_imports(cache_file):
+    if not os.path.exists(cache_file):
+        return set()
+    
+    with open(cache_file, 'r') as f:
+        cached_imports = json.load(f)
+    return set(cached_imports)
+
+def save_cached_imports(cache_file, imports):
+    with open(cache_file, 'w') as f:
+        json.dump(list(imports), f)
 
 def parse_imports(file_path):
     try:
         with open(file_path, 'r') as file:
             tree = ast.parse(file.read())
     except SyntaxError as e:
-        print(f"SyntaxError in file {file_path}: {e}", flush=True)
-        print(f"Line in file with error: {e.text.strip()}\n{' ' * (e.offset - 1)}^", flush=True)
+        log_always(f"SyntaxError in file {file_path}: {e}")
+        log_always(f"Line in file with error: {e.text.strip()}\n{' ' * (e.offset - 1)}^")
         sys.exit(1)
     
     imports = set()
@@ -66,18 +101,6 @@ def create_venv(venv_path):
 def is_module_available(module_name):
     return importlib.util.find_spec(module_name) is not None
 
-def load_cached_imports(cache_file):
-    if not os.path.exists(cache_file):
-        return set()
-    
-    with open(cache_file, 'r') as f:
-        cached_imports = json.load(f)
-    return set(cached_imports)
-
-def save_cached_imports(cache_file, imports):
-    with open(cache_file, 'w') as f:
-        json.dump(list(imports), f)
-
 def install_dependencies(venv_path, dependencies):
     pip_path = os.path.join(venv_path, 'bin', 'pip')
     failed_installs = []
@@ -89,85 +112,86 @@ def install_dependencies(venv_path, dependencies):
         if not is_module_available(dep):
             try:
                 subprocess.run([pip_path, 'install', dep], check=True, capture_output=True, text=True)
-                print(f"Successfully installed {dep}", flush=True)
+                log_always(f"Successfully installed {dep}")
             except subprocess.CalledProcessError as e:
-                print(f"Failed to install {dep}. Error: {e.stderr.strip()}", flush=True)
+                log_always(f"Failed to install {dep}. Error: {e.stderr.strip()}")
                 failed_installs.append(dep)
         else:
-            print(f"Module {dep} is already available. Skipping installation.", flush=True)
+            log(f"Module {dep} is already available. Skipping installation.")
     
     return failed_installs
 
 def run_script(venv_path, script_path, args):
     python_path = os.path.join(venv_path, 'bin', 'python')
-    full_command = [python_path, '-u', script_path] + args  # Add '-u' for unbuffered output
-    print(f"pythrun: Starting execution of {script_path}", flush=True)
-    print(f"pythrun: Full command: {' '.join(full_command)}", flush=True)
+    full_command = [python_path, '-u', script_path] + args
+    log(f"pythrun: Starting execution of {script_path}")
+    log_always(f"pythrun: Full command: {' '.join(full_command)}")
 
     try:
-        print("--- Begin script output ---", flush=True)
+        log_always("--- Begin output ---")
 
-        # Capture both stdout and stderr in the same stream to maintain order
         process = subprocess.run(full_command, stderr=subprocess.STDOUT)
 
-        print("--- End script output ---", flush=True)
+        log_always("--- End output ---")
 
-        print(f"pythrun: Script {script_path} completed. Exit code: {process.returncode}", flush=True)
+        log(f"pythrun: Script {script_path} completed. Exit code: {process.returncode}")
         if process.returncode != 0:
-            print(f"pythrun: Warning: Script exited with non-zero status.", flush=True)
+            log_always(f"pythrun: Warning: Script exited with non-zero status. Exit code: {process.returncode}")
         return process.returncode
     except KeyboardInterrupt:
-        print("\npythrun: Script execution interrupted by user.", flush=True)
+        log_always("\npythrun: Script execution interrupted by user.")
         return 1
     except Exception as e:
-        print(f"pythrun: An unexpected error occurred: {e}", flush=True)
+        log_always(f"pythrun: An unexpected error occurred: {e}")
         return 1
 
 def main():
-    try:
-        if len(sys.argv) < 2:
-            print("Usage: pythrun <script.py> [script arguments...]", flush=True)
-            sys.exit(1)
+    global QUIET_MODE
 
-        script_path = sys.argv[1]
-        script_args = sys.argv[2:]
-        script_dir = os.path.dirname(os.path.abspath(script_path))
-        venv_path = os.path.join(script_dir, '.venv')
-        cache_file = get_cache_file_path(venv_path)
+    parser = argparse.ArgumentParser(description="Run Python scripts with virtualenv and dependency management.")
+    parser.add_argument('script', help="Path to the Python script to run")
+    parser.add_argument('script_args', nargs=argparse.REMAINDER, help="Arguments to pass to the script")
+    parser.add_argument('-q', '--quiet', action='store_true', help="Suppress non-active output")
 
-        if not os.path.exists(venv_path):
-            create_venv(venv_path)
+    args = parser.parse_args()
+    QUIET_MODE = args.quiet
 
-        dependencies = set()
+    script_path = os.path.abspath(args.script)
+    script_args = args.script_args
+    venv_path = get_venv_path(script_path)
+    cache_file = os.path.join(venv_path, CACHE_FILE_NAME)
 
-        # Load cached imports
-        cached_imports = load_cached_imports(cache_file)
+    if not os.path.exists(venv_path):
+        log_always(f"Creating virtual environment at {venv_path}")
+        create_venv(venv_path)
+        create_metadata_file(venv_path, script_path)
 
-        # Parse current imports
-        current_imports = parse_imports(script_path)
+    # Load cached imports
+    cached_imports = load_cached_imports(cache_file)
 
-        # Only install dependencies if imports have changed
-        if current_imports != cached_imports:
-            print("pythrun: Detected new or changed imports. Installing dependencies...", flush=True)
-            failed_installs = install_dependencies(venv_path, current_imports)
-            if failed_installs:
-                print(f"Failed to install the following packages: {', '.join(failed_installs)}", flush=True)
-                print("The script may not run correctly.", flush=True)
-                user_input = input("Do you want to continue anyway? (y/n): ").lower()
-                if user_input != 'y':
-                    print("Aborting script execution.", flush=True)
-                    sys.exit(1)
-            # Save the updated imports to cache
-            save_cached_imports(cache_file, current_imports)
-        else:
-            print("pythrun: No new imports detected. Skipping dependency installation.", flush=True)
+    # Parse current imports
+    current_imports = parse_imports(script_path)
 
-        print("pythrun: Dependency installation complete. Running the script...", flush=True)
-        exit_code = run_script(venv_path, script_path, script_args)
-        sys.exit(exit_code)
-    except KeyboardInterrupt:
-        print("\npythrun: Execution interrupted by user.", flush=True)
-        sys.exit(1)
+    # Only install dependencies if imports have changed
+    if current_imports != cached_imports:
+        log_always("pythrun: Detected new or changed imports. Installing dependencies...")
+        failed_installs = install_dependencies(venv_path, current_imports)
+        if failed_installs:
+            log_always(f"Failed to install the following packages: {', '.join(failed_installs)}")
+            log_always("The script may not run correctly.")
+            user_input = input("Do you want to continue anyway? (y/n): ").lower()
+            if user_input != 'y':
+                log_always("Aborting script execution.")
+                sys.exit(1)
+        # Save the updated imports to cache
+        save_cached_imports(cache_file, current_imports)
+    else:
+        log("pythrun: No new imports detected. Skipping dependency installation.")
+
+    log("pythrun: Dependency installation complete. Running the script...")
+    exit_code = run_script(venv_path, script_path, script_args)
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
+
