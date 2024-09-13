@@ -40,10 +40,10 @@ def parse_imports(file_path):
         with open(file_path, 'r') as file:
             tree = ast.parse(file.read())
     except SyntaxError as e:
-        print(f"SyntaxError in file {file_path}: {e}")
-        print(f"Line in file with error: {e.text.strip()}\n{' ' * (e.offset - 1)}^")
+        print(f"SyntaxError in file {file_path}: {e}", flush=True)
+        print(f"Line in file with error: {e.text.strip()}\n{' ' * (e.offset - 1)}^", flush=True)
         sys.exit(1)
-    
+
     imports = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -52,7 +52,7 @@ def parse_imports(file_path):
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 imports.add(node.module.split('.')[0])
-    
+
     return imports
 
 def create_venv(venv_path):
@@ -72,43 +72,45 @@ def install_dependencies(venv_path, dependencies):
         if not is_module_available(dep):
             try:
                 subprocess.run([pip_path, 'install', dep], check=True, capture_output=True, text=True)
-                print(f"Successfully installed {dep}")
+                print(f"Successfully installed {dep}", flush=True)
             except subprocess.CalledProcessError as e:
-                print(f"Failed to install {dep}. Error: {e.stderr.strip()}")
+                print(f"Failed to install {dep}. Error: {e.stderr.strip()}", flush=True)
                 failed_installs.append(dep)
         else:
-            print(f"Module {dep} is already available. Skipping installation.")
-    
+            print(f"Module {dep} is already available. Skipping installation.", flush=True)
+
     return failed_installs
 
 def run_script(venv_path, script_path, args):
     python_path = os.path.join(venv_path, 'bin', 'python')
-    full_command = [python_path, script_path] + args
-    print(f"pythrun: Starting execution of {script_path}")
-    print(f"pythrun: Full command: {' '.join(full_command)}")
+    full_command = [python_path, '-u', script_path] + args  # Add '-u' for unbuffered output
+    print(f"pythrun: Starting execution of {script_path}", flush=True)
+    print(f"pythrun: Full command: {' '.join(full_command)}", flush=True)
 
     try:
-        print("--- Begin script output ---")
+        print("--- Begin script output ---", flush=True)
 
-        process = subprocess.run(full_command)
+        # Capture both stdout and stderr in the same stream to maintain order
+        process = subprocess.run(full_command, stderr=subprocess.STDOUT)
 
-        print("--- End script output ---")
+        print("--- End script output ---", flush=True)
 
-        print(f"pythrun: Script {script_path} completed. Exit code: {process.returncode}")
+        print(f"pythrun: Script {script_path} completed. Exit code: {process.returncode}", flush=True)
         if process.returncode != 0:
-            print(f"pythrun: Warning: Script exited with non-zero status.")
+            print(f"pythrun: Warning: Script exited with non-zero status.", flush=True)
         return process.returncode
     except KeyboardInterrupt:
-        print("\npythrun: Script execution interrupted by user.")
+        print("\npythrun: Script execution interrupted by user.", flush=True)
         return 1
     except Exception as e:
-        print(f"pythrun: An unexpected error occurred: {e}")
+        print(f"pythrun: An unexpected error occurred: {e}", flush=True)
         return 1
+
 
 def main():
     try:
         if len(sys.argv) < 2:
-            print("Usage: pythrun <script.py> [script arguments...]")
+            print("Usage: pythrun <script.py> [script arguments...]", flush=True)
             sys.exit(1)
 
         script_path = sys.argv[1]
@@ -132,18 +134,18 @@ def main():
         failed_installs = install_dependencies(venv_path, dependencies)
 
         if failed_installs:
-            print(f"Failed to install the following packages: {', '.join(failed_installs)}")
-            print("The script may not run correctly.")
+            print(f"Failed to install the following packages: {', '.join(failed_installs)}", flush=True)
+            print("The script may not run correctly.", flush=True)
             user_input = input("Do you want to continue anyway? (y/n): ").lower()
             if user_input != 'y':
-                print("Aborting script execution.")
+                print("Aborting script execution.", flush=True)
                 sys.exit(1)
 
-        print("pythrun: Dependency installation complete. Running the script...")
+        print("pythrun: Dependency installation complete. Running the script...", flush=True)
         exit_code = run_script(venv_path, script_path, script_args)
         sys.exit(exit_code)
     except KeyboardInterrupt:
-        print("\npythrun: Execution interrupted by user.")
+        print("\npythrun: Execution interrupted by user.", flush=True)
         sys.exit(1)
 
 if __name__ == "__main__":
