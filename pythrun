@@ -36,8 +36,10 @@ import json
 import hashlib
 import time
 import argparse
+import shutil
+import pkgutil
 
-CACHE_FILE_NAME = 'imports_cache.txt'
+CACHE_FILE_NAME = 'imports_cache.json'
 METADATA_FILE_NAME = 'metadata.json'
 
 # Log function for general (verbose) output
@@ -49,10 +51,22 @@ def log(message):
 def log_always(message):
     print(message, flush=True)
 
-def get_venv_path(script_path):
-    hashed_script_path = hashlib.md5(script_path.encode()).hexdigest()
+def get_venv_path(script_path, dependency_source, requirements_file=None):
     base_venv_dir = os.getenv('PYTHRUN_VENVS_DIR', os.path.expanduser('~/.pythrun_venvs'))
-    return os.path.join(base_venv_dir, hashed_script_path)
+
+    if dependency_source == 'requirements' and requirements_file:
+        # Use the requirements file path for hashing
+        # For general requirements.txt, share the virtual environment
+        # Hash the absolute path to the requirements file
+        requirements_path = os.path.abspath(requirements_file)
+        hashed_req_path = hashlib.md5(requirements_path.encode()).hexdigest()
+        venv_name = f"req_{hashed_req_path}"
+    else:
+        # For script-specific requirements or parsed imports, use the script path
+        hashed_script_path = hashlib.md5(script_path.encode()).hexdigest()
+        venv_name = f"script_{hashed_script_path}"
+
+    return os.path.join(base_venv_dir, venv_name)
 
 def create_metadata_file(venv_path, script_path):
     metadata = {
@@ -63,17 +77,23 @@ def create_metadata_file(venv_path, script_path):
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f)
 
-def load_cached_imports(cache_file):
+def load_cached_dependencies(cache_file):
     if not os.path.exists(cache_file):
-        return set()
-    
-    with open(cache_file, 'r') as f:
-        cached_imports = json.load(f)
-    return set(cached_imports)
+        return set(), None
 
-def save_cached_imports(cache_file, imports):
+    with open(cache_file, 'r') as f:
+        cache_data = json.load(f)
+    cached_dependencies = set(cache_data.get('dependencies', []))
+    dependency_source = cache_data.get('dependency_source', 'imports')
+    return cached_dependencies, dependency_source
+
+def save_cached_dependencies(cache_file, dependencies, dependency_source):
+    cache_data = {
+        'dependencies': list(dependencies),
+        'dependency_source': dependency_source
+    }
     with open(cache_file, 'w') as f:
-        json.dump(list(imports), f)
+        json.dump(cache_data, f)
 
 def parse_imports(file_path):
     try:
@@ -83,7 +103,7 @@ def parse_imports(file_path):
         log_always(f"SyntaxError in file {file_path}: {e}")
         log_always(f"Line in file with error: {e.text.strip()}\n{' ' * (e.offset - 1)}^")
         sys.exit(1)
-    
+
     imports = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -92,24 +112,32 @@ def parse_imports(file_path):
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 imports.add(node.module.split('.')[0])
-    
+
     return imports
 
-def create_venv(venv_path):
-    venv.create(venv_path, with_pip=True, system_site_packages=True)
+def create_venv(venv_path, system_site_packages=True):
+    venv.create(venv_path, with_pip=True, system_site_packages=system_site_packages)
 
-def is_module_available(module_name):
-    return importlib.util.find_spec(module_name) is not None
+def is_module_available(python_executable, module_name):
+    try:
+        subprocess.run([python_executable, '-c', f'import {module_name}'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+def is_builtin_module(module_name):
+    return module_name in sys.builtin_module_names or pkgutil.find_loader(module_name) is None
 
 def install_dependencies(venv_path, dependencies):
     pip_path = os.path.join(venv_path, 'bin', 'pip')
+    python_path = os.path.join(venv_path, 'bin', 'python')
     failed_installs = []
     for dep in dependencies:
         dep_mapping = {
             'yaml': 'pyyaml',
         }
         dep = dep_mapping.get(dep, dep)
-        if not is_module_available(dep):
+        if not is_module_available(python_path, dep):
             try:
                 subprocess.run([pip_path, 'install', dep], check=True, capture_output=True, text=True)
                 log_always(f"Successfully installed {dep}")
@@ -117,8 +145,8 @@ def install_dependencies(venv_path, dependencies):
                 log_always(f"Failed to install {dep}. Error: {e.stderr.strip()}")
                 failed_installs.append(dep)
         else:
-            log(f"Module {dep} is already available. Skipping installation.")
-    
+            log(f"Module {dep} is already available in the virtual environment. Skipping installation.")
+
     return failed_installs
 
 def run_script(venv_path, script_path, args):
@@ -145,6 +173,10 @@ def run_script(venv_path, script_path, args):
         log_always(f"pythrun: An unexpected error occurred: {e}")
         return 1
 
+def load_requirements(requirements_file):
+    with open(requirements_file, 'r') as f:
+        return set(line.strip() for line in f if line.strip() and not line.startswith('#'))
+
 def main():
     global QUIET_MODE
 
@@ -152,41 +184,109 @@ def main():
     parser.add_argument('script', help="Path to the Python script to run")
     parser.add_argument('script_args', nargs=argparse.REMAINDER, help="Arguments to pass to the script")
     parser.add_argument('-q', '--quiet', action='store_true', help="Suppress non-active output")
+    parser.add_argument('--no-system-packages', action='store_true', help="Do not include system site packages in the virtual environment")
 
     args = parser.parse_args()
     QUIET_MODE = args.quiet
 
-    script_path = os.path.abspath(args.script)
+    # Resolve the real script path in case it's a symlink
+    script_path = os.path.realpath(os.path.abspath(args.script))
     script_args = args.script_args
-    venv_path = get_venv_path(script_path)
+
+    script_dir = os.path.dirname(script_path)
+    script_base = os.path.basename(script_path)
+    script_name, _ = os.path.splitext(script_base)
+    file_requirements = os.path.join(script_dir, f"{script_name}.requirements.txt")
+    general_requirements = os.path.join(script_dir, "requirements.txt")
+
+    # Determine current dependency source and dependencies
+    if os.path.exists(file_requirements):
+        log(f"pythrun: Using script-specific requirements file: {file_requirements}")
+        requirements_file = file_requirements
+        dependencies = load_requirements(file_requirements)
+        dependency_source = 'requirements'
+    elif os.path.exists(general_requirements):
+        log(f"pythrun: Using general requirements file: {general_requirements}")
+        requirements_file = general_requirements
+        dependencies = load_requirements(general_requirements)
+        dependency_source = 'requirements'
+    else:
+        log("pythrun: No requirements file found. Parsing imports from script.")
+        requirements_file = None
+        dependencies = parse_imports(script_path)
+        dependency_source = 'imports'
+
+    # Get virtual environment path based on dependency source
+    venv_path = get_venv_path(script_path, dependency_source, requirements_file)
     cache_file = os.path.join(venv_path, CACHE_FILE_NAME)
+
+    # Load cached dependencies and dependency source
+    cached_dependencies, cached_dependency_source = load_cached_dependencies(cache_file)
+
+    # Check if dependency source has changed
+    if cached_dependency_source != dependency_source:
+        if os.path.exists(venv_path):
+            log_always("pythrun: Dependency source has changed. Recreating virtual environment.")
+            shutil.rmtree(venv_path)
+        log_always(f"Creating virtual environment at {venv_path}")
+        create_venv(venv_path, system_site_packages=not args.no_system_packages)
+        create_metadata_file(venv_path, script_path)
+        # Force installation of dependencies
+        dependencies_changed = True
+    else:
+        # Check if dependencies have changed
+        dependencies_changed = dependencies != cached_dependencies
+        if dependencies_changed and dependency_source == 'requirements':
+            log_always("pythrun: Requirements file has changed. Reinstalling dependencies.")
 
     if not os.path.exists(venv_path):
         log_always(f"Creating virtual environment at {venv_path}")
-        create_venv(venv_path)
+        create_venv(venv_path, system_site_packages=not args.no_system_packages)
         create_metadata_file(venv_path, script_path)
 
-    # Load cached imports
-    cached_imports = load_cached_imports(cache_file)
+    python_path = os.path.join(venv_path, 'bin', 'python')
 
-    # Parse current imports
-    current_imports = parse_imports(script_path)
-
-    # Only install dependencies if imports have changed
-    if current_imports != cached_imports:
-        log_always("pythrun: Detected new or changed imports. Installing dependencies...")
-        failed_installs = install_dependencies(venv_path, current_imports)
-        if failed_installs:
-            log_always(f"Failed to install the following packages: {', '.join(failed_installs)}")
-            log_always("The script may not run correctly.")
-            user_input = input("Do you want to continue anyway? (y/n): ").lower()
-            if user_input != 'y':
-                log_always("Aborting script execution.")
-                sys.exit(1)
-        # Save the updated imports to cache
-        save_cached_imports(cache_file, current_imports)
+    if dependencies_changed:
+        if dependency_source == 'requirements':
+            # Install dependencies from requirements file
+            failed_installs = install_dependencies(venv_path, dependencies)
+            if failed_installs:
+                log_always(f"Failed to install the following packages: {', '.join(failed_installs)}")
+                log_always("The script may not run correctly.")
+                user_input = input("Do you want to continue anyway? (y/n): ").lower()
+                if user_input != 'y':
+                    log_always("Aborting script execution.")
+                    sys.exit(1)
+        else:
+            # If using imports and dependencies have changed
+            log_always("pythrun: Detected new or changed imports. Installing dependencies...")
+            failed_installs = install_dependencies(venv_path, dependencies)
+            if failed_installs:
+                log_always(f"Failed to install the following packages: {', '.join(failed_installs)}")
+                log_always("The script may not run correctly.")
+                user_input = input("Do you want to continue anyway? (y/n): ").lower()
+                if user_input != 'y':
+                    log_always("Aborting script execution.")
+                    sys.exit(1)
+        # Save the updated dependencies and dependency source to cache
+        save_cached_dependencies(cache_file, dependencies, dependency_source)
     else:
-        log("pythrun: No new imports detected. Skipping dependency installation.")
+        log("pythrun: No changes in dependencies detected. Skipping dependency installation.")
+
+    # Check for missing dependencies when using requirements
+    if dependency_source == 'requirements':
+        # Parse imports to check for missing dependencies
+        current_imports = parse_imports(script_path)
+        missing_dependencies = set()
+        for module_name in current_imports:
+            if is_builtin_module(module_name):
+                continue  # Skip built-in modules
+            if not is_module_available(python_path, module_name):
+                missing_dependencies.add(module_name)
+        if missing_dependencies:
+            log_always(f"pythrun: The following modules are not available in the virtual environment: {', '.join(missing_dependencies)}")
+            log_always("pythrun: They may be missing from the requirements file(s) or failed to install.")
+            sys.exit(1)
 
     log("pythrun: Dependency installation complete. Running the script...")
     exit_code = run_script(venv_path, script_path, script_args)
@@ -194,4 +294,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
